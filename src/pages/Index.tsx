@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import Icon from '@/components/ui/icon';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type Screen = 'menu' | 'battle' | 'leaderboard' | 'shop';
+type Screen = 'menu' | 'battle' | 'leaderboard' | 'shop' | 'wandering' | 'clan';
 type BattleMode = 'solo' | '2player' | '3player';
 type Zone = 'head' | 'body' | 'legs';
 type ZoneState = 'idle' | 'hit' | 'block' | 'dodge';
@@ -55,12 +55,17 @@ const LOCKED_SLOTS = 5;
 // ─── Game state (coins, owned fighters) ──────────────────────────────────────
 interface GameState {
   coins: number;
+  energy: number;
   ownedClasses: FighterClassId[];
   selectedClass: FighterClassId;
 }
 
+const MAX_ENERGY = 100;
+const ENERGY_COST_PER_COIN = 10; // 1 energy = 10 coins
+
 const INITIAL_GAME: GameState = {
   coins: 1240,
+  energy: 85,
   ownedClasses: ['standard'],
   selectedClass: 'standard',
 };
@@ -328,9 +333,13 @@ function FighterPanel({ name, hp, maxHp, rating, classId, side, shake, headState
 }
 
 // ─── Battle logic ─────────────────────────────────────────────────────────────
+// Rules:
+//  normal:   1 atk + 1 def
+//  dbl-def:  0 atk + 2 def  (no extra strike allowed)
+//  dbl-atk:  2 atk + 1 def  (only when doubleStrike available; dbl-def then forbidden)
 interface PlayerChoice {
-  atkZones: Zone[];
-  defZones: Zone[];
+  atkZones: Zone[];   // up to 2 when dbl-atk, else 1
+  defZones: Zone[];   // up to 2 when dbl-def, else 1
   mode: 'normal' | 'dbl-atk' | 'dbl-def';
 }
 
@@ -572,25 +581,73 @@ function BattleScreen({ mode, playerRating, playerClass, onBack }: {
     }, 1600);
   }, [choices, isSolo, aiChoose]);
 
-  function toggleAtk(pi: 0 | 1, z: Zone) {
+  // ── Choice helpers with strict rules ──────────────────────────────────────
+  function selectAtk(pi: 0 | 1, z: Zone) {
     setChoices(prev => {
-      const c = { ...prev[pi] };
-      if (c.mode === 'dbl-def') return prev;
-      if (c.atkZones.includes(z)) { c.atkZones = c.atkZones.filter(x => x !== z); }
-      else { const max = c.mode === 'dbl-atk' ? 2 : 1; c.atkZones = [...c.atkZones.slice(-(max - 1)), z]; }
-      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice]; next[pi] = c; return next;
+      const c = { ...prev[pi], atkZones: [...prev[pi].atkZones] };
+      if (c.mode === 'dbl-def') return prev; // dbl-def = no attack allowed
+
+      if (c.mode === 'dbl-atk') {
+        // Toggle: if already has 2, replace last; allow same zone twice
+        if (c.atkZones.length >= 2) {
+          c.atkZones = [c.atkZones[0], z]; // replace second
+        } else {
+          c.atkZones = [...c.atkZones, z];
+        }
+      } else {
+        // normal: exactly 1 atk
+        c.atkZones = [z];
+      }
+      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice];
+      next[pi] = c; return next;
     });
   }
-  function toggleDef(pi: 0 | 1, z: Zone) {
+
+  function selectDef(pi: 0 | 1, z: Zone) {
     setChoices(prev => {
-      const c = { ...prev[pi] };
-      if (c.defZones.includes(z)) { c.defZones = c.defZones.filter(x => x !== z); }
-      else { const max = c.mode === 'dbl-def' ? 2 : 1; c.defZones = [...c.defZones.slice(-(max - 1)), z]; }
-      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice]; next[pi] = c; return next;
+      const c = { ...prev[pi], defZones: [...prev[pi].defZones] };
+      if (c.mode === 'dbl-def') {
+        // toggle second zone
+        if (c.defZones.includes(z)) {
+          c.defZones = c.defZones.filter(x => x !== z);
+        } else if (c.defZones.length < 2) {
+          c.defZones = [...c.defZones, z];
+        } else {
+          c.defZones = [c.defZones[0], z]; // replace second
+        }
+      } else {
+        // normal / dbl-atk: exactly 1 def
+        c.defZones = [z];
+      }
+      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice];
+      next[pi] = c; return next;
     });
   }
-  function setMode(pi: 0 | 1, m: PlayerChoice['mode']) {
-    setChoices(prev => { const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice]; next[pi] = { ...emptyChoice(), mode: m }; return next; });
+
+  function activateDblDef(pi: 0 | 1) {
+    // Switch to dbl-def: clear atk, reset def
+    setChoices(prev => {
+      const c = prev[pi];
+      const newMode: PlayerChoice['mode'] = c.mode === 'dbl-def' ? 'normal' : 'dbl-def';
+      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice];
+      next[pi] = { atkZones: [], defZones: newMode === 'dbl-def' ? c.defZones.slice(0, 1) : [], mode: newMode };
+      return next;
+    });
+  }
+
+  function activateDblAtk(pi: 0 | 1) {
+    // Switch to dbl-atk: can only have 1 def, can't do dbl-def
+    setChoices(prev => {
+      const c = prev[pi];
+      const newMode: PlayerChoice['mode'] = c.mode === 'dbl-atk' ? 'normal' : 'dbl-atk';
+      const next: [PlayerChoice, PlayerChoice] = [...prev] as [PlayerChoice, PlayerChoice];
+      next[pi] = {
+        atkZones: newMode === 'dbl-atk' ? c.atkZones.slice(0, 1) : c.atkZones.slice(0, 1),
+        defZones: c.defZones.slice(0, 1), // keep max 1 def when dbl-atk
+        mode: newMode,
+      };
+      return next;
+    });
   }
 
   function canFight(pi: 0 | 1) {
@@ -602,39 +659,82 @@ function BattleScreen({ mode, playerRating, playerClass, onBack }: {
 
   function PlayerControls({ pi }: { pi: 0 | 1 }) {
     const c = choices[pi];
-    const hasDbl = battle.doubleStrike[pi];
+    const hasDblStrike = battle.doubleStrike[pi];
     const isP2 = pi === 1;
+    const accentColor = isP2 ? '#00c8ff' : '#f0b429';
+
     return (
       <div className="cyber-panel rounded-xl p-2.5" style={isP2 ? { borderColor: 'rgba(0,200,255,0.22)' } : {}}>
+        {/* Header */}
         <div className="flex items-center justify-between mb-2">
-          <span className="font-cinzel font-bold" style={{ fontSize: 10, color: isP2 ? '#00c8ff' : '#f0b429', letterSpacing: '0.1em' }}>
+          <span className="font-cinzel font-bold" style={{ fontSize: 10, color: accentColor, letterSpacing: '0.1em' }}>
             — ИГРОК {pi + 1} —
           </span>
-          {hasDbl && (
-            <div className="flex items-center gap-1">
-              <button onClick={() => setMode(pi, c.mode === 'dbl-atk' ? 'normal' : 'dbl-atk')}
-                className={`font-cinzel rounded px-2 py-0.5 transition-all ${c.mode === 'dbl-atk' ? 'btn-red' : 'btn-ghost'}`} style={{ fontSize: 9 }}>
-                ⚔️×2
+          <div className="flex items-center gap-1.5">
+            {/* Double defend toggle — always available */}
+            <button
+              onClick={() => activateDblDef(pi)}
+              disabled={battle.phase !== 'choose' || c.mode === 'dbl-atk'}
+              title="Двойной блок (без атаки)"
+              className={`font-cinzel rounded px-2 py-0.5 transition-all ${c.mode === 'dbl-def' ? 'btn-blue' : 'btn-ghost'} ${c.mode === 'dbl-atk' ? 'opacity-30' : ''}`}
+              style={{ fontSize: 9 }}>
+              🛡️×2
+            </button>
+            {/* Double strike — only when earned */}
+            {hasDblStrike && (
+              <button
+                onClick={() => activateDblAtk(pi)}
+                disabled={battle.phase !== 'choose' || c.mode === 'dbl-def'}
+                title="Доп. удар (нельзя при двойном блоке)"
+                className={`font-cinzel rounded px-2 py-0.5 transition-all ${c.mode === 'dbl-atk' ? 'btn-red' : 'btn-ghost'} ${c.mode === 'dbl-def' ? 'opacity-30' : ''}`}
+                style={{ fontSize: 9 }}>
+                ⚔️+1 ⚡
               </button>
-              <button onClick={() => setMode(pi, c.mode === 'dbl-def' ? 'normal' : 'dbl-def')}
-                className={`font-cinzel rounded px-2 py-0.5 transition-all ${c.mode === 'dbl-def' ? 'btn-blue' : 'btn-ghost'}`} style={{ fontSize: 9 }}>
-                🛡️×2
-              </button>
-            </div>
-          )}
+            )}
+          </div>
         </div>
+
+        {/* Attack row — hidden in dbl-def */}
         {c.mode !== 'dbl-def' && (
-          <div className="mb-1.5">
-            <div className="font-cinzel mb-1" style={{ fontSize: 9, color: '#c0392b' }}>УДАР {c.mode === 'dbl-atk' && <span style={{ color: '#e74c3c' }}>(×2)</span>}</div>
+          <div className="mb-2">
+            <div className="font-cinzel mb-1 flex items-center gap-1" style={{ fontSize: 9, color: '#c0392b' }}>
+              УДАР
+              {c.mode === 'dbl-atk' && (
+                <span style={{ color: '#e74c3c', fontSize: 8 }}>(+1 доп. удар — выбери 2)</span>
+              )}
+            </div>
             <div className="flex gap-1.5">
-              {ZONES.map(z => <ZoneBtn key={z} zone={z} type="atk" selected={c.atkZones.includes(z)} count={c.atkZones.filter(x => x === z).length} onClick={() => toggleAtk(pi, z)} disabled={battle.phase !== 'choose'}/>)}
+              {ZONES.map(z => {
+                const hitCount = c.atkZones.filter(x => x === z).length;
+                const isSelected = hitCount > 0;
+                return (
+                  <ZoneBtn key={z} zone={z} type="atk"
+                    selected={isSelected}
+                    count={hitCount}
+                    onClick={() => selectAtk(pi, z)}
+                    disabled={battle.phase !== 'choose'}
+                  />
+                );
+              })}
             </div>
           </div>
         )}
+
+        {/* Defense row */}
         <div>
-          <div className="font-cinzel mb-1" style={{ fontSize: 9, color: '#00c8ff' }}>БЛОК {c.mode === 'dbl-def' && <span style={{ color: '#00c8ff' }}>(×2)</span>}</div>
+          <div className="font-cinzel mb-1 flex items-center gap-1" style={{ fontSize: 9, color: '#00c8ff' }}>
+            БЛОК
+            {c.mode === 'dbl-def' && <span style={{ color: '#00c8ff', fontSize: 8 }}>(двойной — выбери 2 зоны)</span>}
+            {c.mode === 'dbl-atk' && <span style={{ color: '#8888aa', fontSize: 8 }}>(только 1 при доп. ударе)</span>}
+          </div>
           <div className="flex gap-1.5">
-            {ZONES.map(z => <ZoneBtn key={z} zone={z} type="def" selected={c.defZones.includes(z)} onClick={() => toggleDef(pi, z)} disabled={battle.phase !== 'choose'}/>)}
+            {ZONES.map(z => (
+              <ZoneBtn key={z} zone={z} type="def"
+                selected={c.defZones.includes(z)}
+                onClick={() => selectDef(pi, z)}
+                disabled={battle.phase !== 'choose'}
+              />
+            ))}
           </div>
         </div>
       </div>
@@ -727,126 +827,209 @@ function BattleScreen({ mode, playerRating, playerClass, onBack }: {
 }
 
 // ─── Shop ─────────────────────────────────────────────────────────────────────
+type ShopTab = 'fighters' | 'energy' | 'clan' | 'wandering';
+
 function Shop({ onBack, gameState, setGameState }: {
   onBack: () => void;
   gameState: GameState;
   setGameState: (g: GameState) => void;
 }) {
+  const [tab, setTab] = useState<ShopTab>('fighters');
   const [bought, setBought] = useState<FighterClassId | null>(null);
+  const [energyAmt, setEnergyAmt] = useState(10);
 
   function buyFighter(fc: FighterClass) {
     if (gameState.coins < fc.price || gameState.ownedClasses.includes(fc.id)) return;
-    setGameState({
-      ...gameState,
-      coins: gameState.coins - fc.price,
-      ownedClasses: [...gameState.ownedClasses, fc.id],
-    });
+    setGameState({ ...gameState, coins: gameState.coins - fc.price, ownedClasses: [...gameState.ownedClasses, fc.id] });
     setBought(fc.id);
     setTimeout(() => setBought(null), 1500);
   }
 
-  const lockedSlots = Array.from({ length: LOCKED_SLOTS });
+  function buyEnergy(amount: number) {
+    const cost = amount * ENERGY_COST_PER_COIN;
+    if (gameState.coins < cost) return;
+    const newEnergy = Math.min(MAX_ENERGY, gameState.energy + amount);
+    setGameState({ ...gameState, coins: gameState.coins - cost, energy: newEnergy });
+  }
+
+  const TABS: { id: ShopTab; label: string; icon: string }[] = [
+    { id: 'fighters', label: 'Бойцы', icon: '⚔️' },
+    { id: 'energy',   label: 'Энергия', icon: '⚡' },
+    { id: 'clan',     label: 'Клан', icon: '🏰' },
+    { id: 'wandering',label: 'Странствие', icon: '🗺️' },
+  ];
 
   return (
     <div className="flex-1 flex flex-col cyber-bg">
+      {/* Header */}
       <div className="cyber-panel flex items-center gap-3 px-4 py-3" style={{ borderBottom: '1px solid rgba(240,180,41,0.15)', flexShrink: 0 }}>
         <button onClick={onBack} className="btn-ghost rounded px-3 py-1.5 text-xs flex items-center gap-1">
           <Icon name="ChevronLeft" size={14}/> Назад
         </button>
         <h2 className="font-cinzel text-lg font-bold" style={{ color: '#f0b429' }}>МАГАЗИН</h2>
-        <div className="ml-auto flex items-center gap-1.5">
-          <span>🪙</span>
-          <span className="font-cinzel font-bold" style={{ color: '#f0d080', fontSize: 14 }}>{gameState.coins.toLocaleString()}</span>
+        <div className="ml-auto flex items-center gap-3">
+          <div className="flex items-center gap-1"><span>⚡</span><span className="font-cinzel font-bold" style={{ color: '#c8860a', fontSize: 12 }}>{gameState.energy}</span></div>
+          <div className="flex items-center gap-1"><span>🪙</span><span className="font-cinzel font-bold" style={{ color: '#f0d080', fontSize: 14 }}>{gameState.coins.toLocaleString()}</span></div>
         </div>
       </div>
 
+      {/* Tabs */}
+      <div className="flex border-b" style={{ borderColor: 'rgba(240,180,41,0.12)', flexShrink: 0 }}>
+        {TABS.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className="flex-1 py-2.5 font-cinzel transition-all duration-150 flex flex-col items-center gap-0.5"
+            style={{
+              fontSize: 9, letterSpacing: '0.05em',
+              color: tab === t.id ? '#f0b429' : '#4a3820',
+              borderBottom: tab === t.id ? '2px solid #f0b429' : '2px solid transparent',
+              background: tab === t.id ? 'rgba(240,180,41,0.06)' : 'transparent',
+            }}>
+            <span style={{ fontSize: '1rem' }}>{t.icon}</span>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
       <div className="flex-1 overflow-y-auto p-3">
-        <div className="font-cinzel mb-3" style={{ fontSize: 10, color: '#4a3820', letterSpacing: '0.15em' }}>— БОЙЦЫ —</div>
 
-        <div className="grid grid-cols-1 gap-2.5">
-          {FIGHTER_CLASSES.map((fc, i) => {
-            const owned = gameState.ownedClasses.includes(fc.id);
-            const canBuy = !owned && gameState.coins >= fc.price;
-            const isSelected = gameState.selectedClass === fc.id;
-            const justBought = bought === fc.id;
-
-            return (
-              <div key={fc.id}
-                className={`cyber-panel rounded-xl p-3 animate-fade-in transition-all duration-150 ${isSelected ? 'gold-glow' : ''}`}
-                style={{ animationDelay: `${i * 0.07}s`, animationFillMode: 'backwards', borderColor: `${fc.color}33` }}>
-                <div className="flex items-start gap-3">
-                  {/* SVG preview */}
-                  <div style={{ width: 52, height: 74, flexShrink: 0 }}>
-                    <FighterSVG rating={1000} classId={fc.id}/>
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span style={{ fontSize: '1.1rem' }}>{fc.icon}</span>
-                      <span className="font-cinzel font-bold" style={{ color: fc.color, fontSize: 13 }}>{fc.name}</span>
-                      {owned && <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(46,204,113,0.15)', border: '1px solid rgba(46,204,113,0.3)', color: '#2ecc71' }}>В КОЛЛЕКЦИИ</span>}
-                      {isSelected && <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(240,180,41,0.15)', border: '1px solid rgba(240,180,41,0.3)', color: '#f0b429' }}>ВЫБРАН</span>}
+        {/* ── Fighters tab ── */}
+        {tab === 'fighters' && (
+          <div className="space-y-2.5">
+            {FIGHTER_CLASSES.map((fc, i) => {
+              const owned = gameState.ownedClasses.includes(fc.id);
+              const canBuy = !owned && gameState.coins >= fc.price;
+              const isSelected = gameState.selectedClass === fc.id;
+              return (
+                <div key={fc.id}
+                  className={`cyber-panel rounded-xl p-3 animate-fade-in transition-all duration-150 ${isSelected ? 'gold-glow' : ''}`}
+                  style={{ animationDelay: `${i * 0.07}s`, animationFillMode: 'backwards', borderColor: `${fc.color}33` }}>
+                  <div className="flex items-start gap-3">
+                    <div style={{ width: 52, height: 72, flexShrink: 0 }}>
+                      <FighterSVG rating={1000} classId={fc.id}/>
                     </div>
-
-                    {/* Stats row */}
-                    <div className="flex gap-2 mb-1.5 flex-wrap">
-                      <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(231,76,60,0.12)', border: '1px solid rgba(231,76,60,0.25)', color: '#e74c3c' }}>
-                        HP: {fc.maxHp}
-                      </span>
-                      <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(240,180,41,0.12)', border: '1px solid rgba(240,180,41,0.25)', color: '#f0b429' }}>
-                        Урон ×{fc.dmgMult.toFixed(2)}
-                      </span>
-                    </div>
-
-                    <div style={{ fontSize: 9, color: 'rgba(200,168,106,0.7)', fontFamily: 'Oswald, sans-serif', lineHeight: 1.4, marginBottom: 4 }}>
-                      {fc.desc}
-                    </div>
-
-                    {fc.ability !== '—' && (
-                      <div className="rounded px-2 py-1" style={{ fontSize: 9, background: 'rgba(240,180,41,0.06)', border: '1px solid rgba(240,180,41,0.15)', color: '#c8a060', fontFamily: 'Cinzel, serif' }}>
-                        ✨ {fc.ability}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <span style={{ fontSize: '1.05rem' }}>{fc.icon}</span>
+                        <span className="font-cinzel font-bold" style={{ color: fc.color, fontSize: 13 }}>{fc.name}</span>
+                        {owned && <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(46,204,113,0.15)', border: '1px solid rgba(46,204,113,0.3)', color: '#2ecc71' }}>В КОЛЛЕКЦИИ</span>}
+                        {isSelected && <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(240,180,41,0.15)', border: '1px solid rgba(240,180,41,0.3)', color: '#f0b429' }}>ВЫБРАН</span>}
                       </div>
+                      <div className="flex gap-2 mb-1.5 flex-wrap">
+                        <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(231,76,60,0.12)', border: '1px solid rgba(231,76,60,0.2)', color: '#e74c3c' }}>HP: {fc.maxHp}</span>
+                        <span className="font-cinzel rounded px-1.5 py-0.5" style={{ fontSize: 8, background: 'rgba(240,180,41,0.1)', border: '1px solid rgba(240,180,41,0.2)', color: '#f0b429' }}>Урон ×{fc.dmgMult.toFixed(2)}</span>
+                      </div>
+                      <div style={{ fontSize: 9, color: 'rgba(200,168,106,0.65)', fontFamily: 'Oswald', lineHeight: 1.4, marginBottom: 4 }}>{fc.desc}</div>
+                      {fc.ability !== '—' && (
+                        <div className="rounded px-2 py-1" style={{ fontSize: 9, background: 'rgba(240,180,41,0.05)', border: '1px solid rgba(240,180,41,0.13)', color: '#c8a060', fontFamily: 'Cinzel' }}>✨ {fc.ability}</div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-2.5">
+                    {owned ? (
+                      <button onClick={() => setGameState({ ...gameState, selectedClass: fc.id })}
+                        className={`w-full rounded-lg py-2 font-cinzel text-xs ${isSelected ? 'btn-disabled' : 'btn-gold'}`} disabled={isSelected}>
+                        {isSelected ? '✔ Выбран' : '⚔️ Выбрать бойца'}
+                      </button>
+                    ) : (
+                      <button onClick={() => buyFighter(fc)} disabled={!canBuy}
+                        className={`w-full rounded-lg py-2 font-cinzel text-xs flex items-center justify-center gap-1.5 ${canBuy ? 'btn-gold' : 'btn-disabled'}`}>
+                        {bought === fc.id ? '✔ Куплено!' : (<>🪙 {fc.price.toLocaleString()}</>)}
+                      </button>
                     )}
                   </div>
                 </div>
-
-                {/* Action buttons */}
-                <div className="flex gap-2 mt-2.5">
-                  {owned ? (
-                    <button
-                      onClick={() => setGameState({ ...gameState, selectedClass: fc.id })}
-                      className={`flex-1 rounded-lg py-2 font-cinzel text-xs ${isSelected ? 'btn-disabled' : 'btn-gold'}`}
-                      disabled={isSelected}>
-                      {isSelected ? '✔ Выбран' : '⚔️ Выбрать'}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => buyFighter(fc)}
-                      disabled={!canBuy || fc.price === 0}
-                      className={`flex-1 rounded-lg py-2 font-cinzel text-xs flex items-center justify-center gap-1.5 ${canBuy ? 'btn-gold' : 'btn-disabled'}`}>
-                      {justBought ? '✔ Куплено!' : (<>🪙 <span>{fc.price.toLocaleString()}</span></>)}
-                    </button>
-                  )}
+              );
+            })}
+            {/* Locked */}
+            <div className="font-cinzel mt-1 mb-1" style={{ fontSize: 9, color: '#3a2a10', letterSpacing: '0.15em' }}>— СКОРО —</div>
+            {Array.from({ length: LOCKED_SLOTS }).map((_, i) => (
+              <div key={i} className="cyber-panel rounded-xl p-3 flex items-center gap-3 opacity-35" style={{ border: '1px solid rgba(240,180,41,0.07)' }}>
+                <div className="w-12 h-16 rounded-lg flex items-center justify-center" style={{ background: 'rgba(5,8,16,0.8)' }}>
+                  <span style={{ fontSize: '1.5rem' }}>🔒</span>
+                </div>
+                <div>
+                  <div className="font-cinzel font-bold" style={{ color: '#3a2a10', fontSize: 11 }}>??? Боец {i + 5}</div>
+                  <div style={{ fontSize: 9, color: '#2a1a08', fontFamily: 'Cinzel', marginTop: 2 }}>Ближайшее обновление</div>
                 </div>
               </div>
-            );
-          })}
+            ))}
+          </div>
+        )}
 
-          {/* Locked future fighters */}
-          <div className="font-cinzel mt-2 mb-1" style={{ fontSize: 10, color: '#3a2a10', letterSpacing: '0.15em' }}>— СКОРО —</div>
-          {lockedSlots.map((_, i) => (
-            <div key={i} className="cyber-panel rounded-xl p-3 flex items-center gap-3 opacity-40"
-              style={{ animationFillMode: 'backwards', border: '1px solid rgba(240,180,41,0.08)' }}>
-              <div className="w-12 h-16 rounded-lg flex items-center justify-center" style={{ background: 'rgba(5,8,16,0.8)', border: '1px solid rgba(240,180,41,0.1)' }}>
-                <span style={{ fontSize: '1.5rem' }}>🔒</span>
-              </div>
-              <div>
-                <div className="font-cinzel font-bold" style={{ color: '#3a2a10', fontSize: 12 }}>??? Боец {i + 5}</div>
-                <div style={{ fontSize: 9, color: '#2a1a08', fontFamily: 'Cinzel, serif', marginTop: 2 }}>Ближайшее обновление</div>
+        {/* ── Energy tab ── */}
+        {tab === 'energy' && (
+          <div className="space-y-3">
+            <div className="cyber-panel rounded-xl p-4 text-center" style={{ borderColor: 'rgba(200,134,10,0.3)' }}>
+              <div style={{ fontSize: '2.5rem' }}>⚡</div>
+              <div className="font-cinzel font-bold mt-1" style={{ color: '#f0b429', fontSize: 16 }}>{gameState.energy} / {MAX_ENERGY}</div>
+              <div style={{ fontSize: 10, color: '#6b4f1a', fontFamily: 'Cinzel', marginTop: 4 }}>текущая энергия</div>
+              <div className="w-full h-3 rounded-full overflow-hidden mt-3" style={{ background: 'rgba(5,8,16,0.9)', border: '1px solid rgba(240,180,41,0.2)' }}>
+                <div className="hp-bar h-full rounded-full" style={{ width: `${(gameState.energy / MAX_ENERGY) * 100}%`, background: 'linear-gradient(90deg, #c8860a, #f0b429)' }}/>
               </div>
             </div>
-          ))}
-        </div>
+
+            <div className="font-cinzel" style={{ fontSize: 9, color: '#4a3820', letterSpacing: '0.15em' }}>— КУПИТЬ ЭНЕРГИЮ —</div>
+            <div className="cyber-panel rounded-xl p-3" style={{ borderColor: 'rgba(200,134,10,0.2)' }}>
+              <div className="font-cinzel mb-1" style={{ fontSize: 10, color: '#c8a060' }}>Курс: 1 ⚡ = 10 🪙</div>
+              <div style={{ fontSize: 9, color: '#4a3820', fontFamily: 'Oswald', marginBottom: 12 }}>Максимум {MAX_ENERGY} единиц. Можно добрать до максимума.</div>
+
+              {/* Presets */}
+              <div className="grid grid-cols-2 gap-2">
+                {[10, 20, 50, MAX_ENERGY - gameState.energy].filter((v, i, a) => a.indexOf(v) === i && v > 0).map(amt => {
+                  const cost = amt * ENERGY_COST_PER_COIN;
+                  const canAfford = gameState.coins >= cost;
+                  const wouldOverflow = gameState.energy + amt > MAX_ENERGY;
+                  const actualAmt = Math.min(amt, MAX_ENERGY - gameState.energy);
+                  if (actualAmt <= 0) return null;
+                  return (
+                    <button key={amt} onClick={() => buyEnergy(actualAmt)} disabled={!canAfford}
+                      className={`rounded-lg py-2.5 font-cinzel flex flex-col items-center gap-0.5 ${canAfford ? 'btn-gold' : 'btn-disabled'}`}
+                      style={{ fontSize: 10 }}>
+                      <span style={{ fontSize: '1.1rem' }}>⚡ +{actualAmt}</span>
+                      <span style={{ fontSize: 9 }}>🪙 {(actualAmt * ENERGY_COST_PER_COIN).toLocaleString()}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Clan tab ── */}
+        {tab === 'clan' && (
+          <div className="space-y-3">
+            <div className="cyber-panel rounded-xl p-5 text-center" style={{ borderColor: 'rgba(240,180,41,0.15)' }}>
+              <div style={{ fontSize: '3rem' }}>🏰</div>
+              <div className="font-cinzel font-bold mt-2" style={{ color: '#f0b429', fontSize: 18, letterSpacing: '0.1em' }}>КЛАНОВЫЕ ВОЙНЫ</div>
+              <div className="font-cinzel mt-2" style={{ color: '#4a3820', fontSize: 11, letterSpacing: '0.08em' }}>Ближайшее обновление</div>
+            </div>
+            <div className="font-cinzel" style={{ fontSize: 9, color: '#3a2a10', letterSpacing: '0.12em' }}>— ЧТО БУДЕТ ДОСТУПНО —</div>
+            {['Создай или вступи в клан', 'Клановые сражения 5×5', 'Клановый рейтинг и трофеи', 'Общая казна клана', 'Уникальное клановое снаряжение'].map((f, i) => (
+              <div key={i} className="cyber-panel rounded-xl px-4 py-3 flex items-center gap-3 opacity-50" style={{ border: '1px solid rgba(240,180,41,0.08)' }}>
+                <span style={{ fontSize: '1.2rem' }}>🔒</span>
+                <span style={{ fontSize: 11, color: '#4a3820', fontFamily: 'Oswald' }}>{f}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ── Wandering tab ── */}
+        {tab === 'wandering' && (
+          <div className="space-y-3">
+            <div className="cyber-panel rounded-xl p-5 text-center" style={{ borderColor: 'rgba(240,180,41,0.15)' }}>
+              <div style={{ fontSize: '3rem' }}>🗺️</div>
+              <div className="font-cinzel font-bold mt-2" style={{ color: '#f0b429', fontSize: 18, letterSpacing: '0.1em' }}>СТРАНСТВИЕ</div>
+              <div className="font-cinzel mt-2" style={{ color: '#4a3820', fontSize: 11, letterSpacing: '0.08em' }}>Ближайшее обновление</div>
+            </div>
+            <div className="font-cinzel" style={{ fontSize: 9, color: '#3a2a10', letterSpacing: '0.12em' }}>— ЧТО БУДЕТ ДОСТУПНО —</div>
+            {['Одиночные кампании с сюжетом', 'Уникальные враги и боссы', 'Награды за прохождение', 'Карта мира с регионами', 'Случайные события в пути'].map((f, i) => (
+              <div key={i} className="cyber-panel rounded-xl px-4 py-3 flex items-center gap-3 opacity-50" style={{ border: '1px solid rgba(240,180,41,0.08)' }}>
+                <span style={{ fontSize: '1.2rem' }}>🔒</span>
+                <span style={{ fontSize: 11, color: '#4a3820', fontFamily: 'Oswald' }}>{f}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -855,7 +1038,7 @@ function Shop({ onBack, gameState, setGameState }: {
 // ─── Top Bar ──────────────────────────────────────────────────────────────────
 const PLAYER_RATING = 1887;
 
-function TopBar({ coins }: { coins: number }) {
+function TopBar({ coins, energy }: { coins: number; energy: number }) {
   return (
     <div className="flex items-center justify-between px-4 py-2 cyber-panel" style={{ borderBottom: '1px solid rgba(240,180,41,0.15)', flexShrink: 0 }}>
       <div className="flex items-center gap-3">
@@ -863,9 +1046,9 @@ function TopBar({ coins }: { coins: number }) {
           <span style={{ fontSize: '0.85rem' }}>⚡</span>
           <div className="flex items-center gap-1">
             <div className="w-20 h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(5,8,16,0.8)', border: '1px solid rgba(240,180,41,0.2)' }}>
-              <div className="h-full rounded-full" style={{ width: '85%', background: 'linear-gradient(90deg, #c8860a, #f0b429)', boxShadow: '0 0 6px #f0b429' }}/>
+              <div className="h-full rounded-full" style={{ width: `${(energy / MAX_ENERGY) * 100}%`, background: 'linear-gradient(90deg, #c8860a, #f0b429)', boxShadow: '0 0 6px #f0b429' }}/>
             </div>
-            <span className="font-cinzel" style={{ fontSize: 9, color: '#c8860a' }}>85/100</span>
+            <span className="font-cinzel" style={{ fontSize: 9, color: '#c8860a' }}>{energy}/{MAX_ENERGY}</span>
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -1009,7 +1192,7 @@ export default function Index() {
 
   return (
     <div className="flex flex-col" style={{ minHeight: '100dvh', maxWidth: 480, margin: '0 auto', background: '#050810', overflow: 'hidden' }}>
-      {screen === 'menu' && <TopBar coins={gameState.coins}/>}
+      {screen === 'menu' && <TopBar coins={gameState.coins} energy={gameState.energy}/>}
       {screen === 'menu'        && <MainMenu onNavigate={navigate} selectedClass={gameState.selectedClass}/>}
       {screen === 'battle'      && <BattleScreen mode={battleMode} playerRating={PLAYER_RATING} playerClass={gameState.selectedClass} onBack={() => setScreen('menu')}/>}
       {screen === 'leaderboard' && <Leaderboard onBack={() => setScreen('menu')}/>}

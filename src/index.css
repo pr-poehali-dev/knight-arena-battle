@@ -235,6 +235,23 @@
 .zone-block {
   animation: zone-flash-green 0.7s ease-out forwards;
 }
+@keyframes zone-flash-cyan {
+  0% {
+    fill: rgba(0, 200, 255, 0);
+    stroke: rgba(0, 200, 255, 0);
+  }
+  15% {
+    fill: rgba(0, 200, 255, 0.45);
+    stroke: rgba(0, 200, 255, 1);
+  }
+  100% {
+    fill: rgba(0, 200, 255, 0);
+    stroke: rgba(0, 200, 255, 0);
+  }
+}
+.zone-dodge {
+  animation: zone-flash-cyan 0.7s ease-out forwards;
+}
 
 @keyframes bar-pulse {
   0%,
